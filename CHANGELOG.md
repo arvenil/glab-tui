@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Features
+- **Mark files as reviewed in the diff view** — `m` marks (or unmarks) the selected file as reviewed; on a directory it flips every file below it at once. Reviewed files carry a check indicator and fade to muted in the file tree; a directory fades and folds itself once all of its files are reviewed, cascading up through parents so a finished branch collapses to one line (unmarking reopens it, and a directory reopened by hand stays open). The tree header tracks progress (`12/200`). `M` filters reviewed files out of the tree entirely — directories with nothing left to review go with them — so a 200-file MR shrinks to just the pending work. Marks persist per MR/PR in the project cache and are restored when the diff is reopened; paths no longer present in the diff are dropped on restore (#362).
+
+---
+
 ## [0.8.4] - 2026-08-13
 
 ### Bug Fixes
