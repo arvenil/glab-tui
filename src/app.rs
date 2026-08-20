@@ -1120,6 +1120,29 @@ pub struct DiffView {
     pub reviewed_files: HashSet<String>,
     /// Filter reviewed files out of the tree (`M`).
     pub hide_reviewed: bool,
+    /// Post-image blob SHA per file path, read from the diff's `index` lines.
+    /// Empty when the diff carries no such lines, in which case a changed file
+    /// cannot be detected and marks are kept as they were.
+    pub file_digests: std::collections::HashMap<String, String>,
+}
+
+/// Reads the post-image blob SHA out of a git `index <old>..<new> <mode>` line.
+///
+/// Returns `None` for anything else, and for the all-zero SHA a deleted file
+/// carries — there is no content left to fingerprint. A file whose content did
+/// not change (a pure rename, a mode-only change) has no `index` line at all,
+/// which is why an absent digest must never be read as "changed".
+fn parse_index_post_image(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("index ")?;
+    let (_, post) = rest.split_once("..")?;
+    let post = post.split_whitespace().next()?;
+    if post.is_empty() || post.chars().all(|c| c == '0') {
+        return None;
+    }
+    if !post.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(post.to_string())
 }
 
 fn strip_ansi_escapes(input: &str) -> String {
@@ -1155,6 +1178,9 @@ impl DiffView {
         let mut new_line_num = None;
         let mut files: Vec<(String, Option<String>, bool, bool, usize)> = Vec::new();
         let mut change_counts: std::collections::HashMap<String, (u32, u32)> =
+            std::collections::HashMap::new();
+
+        let mut file_digests: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
         // State tracking for renames
@@ -1230,6 +1256,14 @@ impl DiffView {
                     is_new_file: false,
                     is_deleted_file: true,
                 });
+            } else if let Some(digest) = parse_index_post_image(line) {
+                // `index <old>..<new>` follows `diff --git`, so current_file is
+                // already the post-image path. That second SHA is git's own
+                // content identity for the file — what lets a reviewed mark
+                // notice the file changed under it.
+                if !current_file.is_empty() {
+                    file_digests.insert(current_file.clone(), digest);
+                }
             } else if line.starts_with("--- ") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
@@ -1453,26 +1487,72 @@ impl DiffView {
             file_tree_visible: true,
             reviewed_files: HashSet::new(),
             hide_reviewed: false,
+            file_digests,
         };
 
         view.update_active_lines();
         view
     }
 
-    /// Seeds the reviewed-file marks (restored from the project cache) and the
+    /// Seeds the reviewed-file marks (restored from the project cache, each
+    /// carrying the blob SHA the file had when it was marked) and the
     /// hide-reviewed filter, then rebuilds the tree around them.
-    pub fn restore_review_state(&mut self, reviewed: HashSet<String>, hide_reviewed: bool) {
-        // Drop marks for files no longer in the diff so stale paths never leak
-        // back into the cache.
+    ///
+    /// A mark survives only if the file is still in the diff and still has the
+    /// content it was reviewed against. Anything the author has since touched
+    /// comes back unreviewed, which is the whole point: a mark that outlived
+    /// its content hides the one file that needs looking at again — muted,
+    /// ticked, and folded behind its parent.
+    pub fn restore_review_state(
+        &mut self,
+        marks: std::collections::HashMap<String, String>,
+        hide_reviewed: bool,
+    ) {
         let mut known = Vec::new();
         self.root_node.collect_file_paths(&mut known);
         let known: HashSet<String> = known.into_iter().collect();
-        self.reviewed_files = reviewed.into_iter().filter(|p| known.contains(p)).collect();
+
+        self.reviewed_files = marks
+            .into_iter()
+            .filter(|(path, marked_digest)| {
+                // Dropped from the diff entirely: nothing left to review.
+                known.contains(path) && !self.content_changed(path, marked_digest)
+            })
+            .map(|(path, _)| path)
+            .collect();
+
         self.hide_reviewed = hide_reviewed;
-        // Directories already fully reviewed on a previous pass open folded.
+        // Directories still fully reviewed after that pruning open folded.
         self.root_node
             .sync_expansion_to_review(&HashSet::new(), &self.reviewed_files);
         self.rebuild_visible_nodes_keep_position();
+    }
+
+    /// Whether `path` demonstrably differs from the revision it was marked
+    /// against. Requires both SHAs: an unknown one on either side proves
+    /// nothing, and unmarking on a guess would throw away real review work.
+    /// That also covers the file whose content genuinely did not change — a
+    /// pure rename or a mode-only edit emits no `index` line at all.
+    fn content_changed(&self, path: &str, marked_digest: &str) -> bool {
+        match self.file_digests.get(path) {
+            Some(current) if !current.is_empty() && !marked_digest.is_empty() => {
+                current != marked_digest
+            }
+            _ => false,
+        }
+    }
+
+    /// The reviewed set paired with each file's current blob SHA, as persisted
+    /// in the project cache. A file with no digest is stored with an empty one
+    /// and will simply never be detected as changed.
+    pub fn reviewed_marks(&self) -> std::collections::HashMap<String, String> {
+        self.reviewed_files
+            .iter()
+            .map(|path| {
+                let digest = self.file_digests.get(path).cloned().unwrap_or_default();
+                (path.clone(), digest)
+            })
+            .collect()
     }
 
     /// Files covered by the current tree selection: the selected file itself, or
@@ -2716,25 +2796,30 @@ impl App {
             .count()
     }
 
-    /// Files marked as reviewed for an MR/PR, restored from the project cache.
-    pub fn reviewed_files_for_mr(&self, mr_iid: u64) -> HashSet<String> {
+    /// Files marked as reviewed for an MR/PR — path to the blob SHA it carried
+    /// when it was marked — restored from the project cache.
+    pub fn reviewed_files_for_mr(&self, mr_iid: u64) -> std::collections::HashMap<String, String> {
         self.project_cache
             .reviewed_files
             .get(&mr_iid)
-            .map(|paths| paths.iter().cloned().collect())
+            .cloned()
             .unwrap_or_default()
     }
 
     /// Writes the reviewed-file marks of an MR/PR back into the project cache.
     /// The caller persists the cache to disk.
-    pub fn store_reviewed_files_for_mr(&mut self, mr_iid: u64, reviewed: &HashSet<String>) {
-        if reviewed.is_empty() {
+    pub fn store_reviewed_files_for_mr(
+        &mut self,
+        mr_iid: u64,
+        marks: &std::collections::HashMap<String, String>,
+    ) {
+        if marks.is_empty() {
             self.project_cache.reviewed_files.remove(&mr_iid);
             return;
         }
-        let mut paths: Vec<String> = reviewed.iter().cloned().collect();
-        paths.sort();
-        self.project_cache.reviewed_files.insert(mr_iid, paths);
+        self.project_cache
+            .reviewed_files
+            .insert(mr_iid, marks.clone());
     }
 
     pub fn unresolved_threads_count_for_path(&self, path: &str) -> usize {
@@ -5885,6 +5970,166 @@ index 123456..789012 100644
         DiffView::new(42, diff.to_string())
     }
 
+    /// Cached marks whose digest is unknown — the shape a diff with no `index`
+    /// lines produces, where a changed file can never be detected.
+    fn marks(paths: &[&str]) -> std::collections::HashMap<String, String> {
+        paths
+            .iter()
+            .map(|p| ((*p).to_string(), String::new()))
+            .collect()
+    }
+
+    /// A one-file diff for `src/app.rs` whose post-image blob SHA is `post`.
+    /// An empty `post` omits the `index` line entirely, as git does for a file
+    /// whose content did not change.
+    fn digest_fixture(post: &str) -> DiffView {
+        let index_line = if post.is_empty() {
+            String::new()
+        } else {
+            format!("index 1111111..{} 100644\n", post)
+        };
+        let diff = format!(
+            "diff --git a/src/app.rs b/src/app.rs\n{}--- a/src/app.rs\n+++ b/src/app.rs\n@@ -1,1 +1,1 @@\n- old\n+ new\n",
+            index_line
+        );
+        DiffView::new(42, diff)
+    }
+
+    #[test]
+    fn test_parse_index_post_image() {
+        assert_eq!(
+            parse_index_post_image("index bd0daa2..7bb50a2 100644").as_deref(),
+            Some("7bb50a2")
+        );
+        // Full 40-char SHAs, as `glab mr diff --raw` emits them.
+        assert_eq!(
+            parse_index_post_image(&format!(
+                "index {}..{} 100644",
+                "0".repeat(39) + "1",
+                "a".repeat(40)
+            ))
+            .as_deref(),
+            Some("a".repeat(40).as_str())
+        );
+        // No mode suffix (git omits it when the mode is unchanged on both sides).
+        assert_eq!(
+            parse_index_post_image("index abc1234..def5678").as_deref(),
+            Some("def5678")
+        );
+        // A deleted file's post-image is all zeros: no content to fingerprint.
+        assert_eq!(
+            parse_index_post_image("index abc1234..0000000 100644"),
+            None
+        );
+        assert_eq!(parse_index_post_image("--- a/src/app.rs"), None);
+        assert_eq!(parse_index_post_image("index nonsense"), None);
+        assert_eq!(parse_index_post_image("index abc..zzzz"), None);
+    }
+
+    #[test]
+    fn test_diff_view_reads_blob_digests_from_index_lines() {
+        let view = digest_fixture("7bb50a2");
+        assert_eq!(
+            view.file_digests.get("src/app.rs").map(String::as_str),
+            Some("7bb50a2")
+        );
+        // A diff with no index lines simply has no digests to offer.
+        assert!(digest_fixture("").file_digests.is_empty());
+    }
+
+    #[test]
+    fn test_restore_drops_a_mark_whose_file_changed() {
+        let mut view = digest_fixture("bbbbbbb");
+        let mut cached = std::collections::HashMap::new();
+        cached.insert("src/app.rs".to_string(), "aaaaaaa".to_string());
+        view.restore_review_state(cached, false);
+
+        assert!(
+            view.reviewed_files.is_empty(),
+            "a file whose blob changed must come back unreviewed"
+        );
+        assert_eq!(view.review_progress(), (0, 1));
+    }
+
+    #[test]
+    fn test_restore_keeps_a_mark_whose_file_is_untouched() {
+        let mut view = digest_fixture("aaaaaaa");
+        let mut cached = std::collections::HashMap::new();
+        cached.insert("src/app.rs".to_string(), "aaaaaaa".to_string());
+        view.restore_review_state(cached, false);
+
+        assert!(view.reviewed_files.contains("src/app.rs"));
+    }
+
+    #[test]
+    fn test_restore_keeps_a_mark_when_either_digest_is_unknown() {
+        // No index line in the diff: content did not change (rename, mode-only),
+        // or the backend cannot supply SHAs at all. Either way, unmarking would
+        // be a guess that throws away real review work.
+        let mut view = digest_fixture("");
+        let mut cached = std::collections::HashMap::new();
+        cached.insert("src/app.rs".to_string(), "aaaaaaa".to_string());
+        view.restore_review_state(cached, false);
+        assert!(view.reviewed_files.contains("src/app.rs"));
+
+        // Marked before digests were recorded, seen now with one.
+        let mut view = digest_fixture("bbbbbbb");
+        view.restore_review_state(marks(&["src/app.rs"]), false);
+        assert!(view.reviewed_files.contains("src/app.rs"));
+    }
+
+    #[test]
+    fn test_reviewed_marks_carry_the_current_digest() {
+        let mut view = digest_fixture("7bb50a2");
+        view.selected_visible_idx = view
+            .visible_nodes
+            .iter()
+            .position(|n| !n.is_dir)
+            .expect("a file row");
+        view.toggle_reviewed();
+
+        let stored = view.reviewed_marks();
+        assert_eq!(
+            stored.get("src/app.rs").map(String::as_str),
+            Some("7bb50a2")
+        );
+    }
+
+    #[test]
+    fn test_a_changed_file_reappears_from_behind_its_folded_directory() {
+        // The failure this whole change exists to prevent: every file in src/
+        // reviewed, so the directory folds; then one of them is rewritten. It
+        // must come back visible and unreviewed, not muted and hidden.
+        let mut view = review_fixture();
+        view.selected_visible_idx = 0; // src/
+        view.toggle_reviewed();
+        assert!(!view.visible_nodes[0].is_expanded);
+        let stored = view.reviewed_marks();
+
+        // src/main.rs comes back with different content.
+        let changed = review_fixture().raw_diff.replace(
+            "index 123456..789012 100644\n--- a/src/main.rs",
+            "index 123456..ffffff0 100644\n--- a/src/main.rs",
+        );
+        let mut updated = DiffView::new(42, changed);
+        updated.restore_review_state(stored, false);
+
+        assert_eq!(
+            updated.reviewed_files,
+            ["src/app.rs".to_string()].into_iter().collect()
+        );
+        let names: Vec<&str> = updated
+            .visible_nodes
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"main.rs"),
+            "the changed file must be visible again, got {names:?}"
+        );
+        assert!(!updated.visible_nodes[0].is_reviewed);
+    }
+
     #[test]
     fn test_toggle_reviewed_marks_selected_file() {
         let mut view = review_fixture();
@@ -6048,11 +6293,7 @@ index 123456..789012 100644
     #[test]
     fn test_restore_review_state_opens_completed_directories_folded() {
         let mut view = review_fixture();
-        let cached: HashSet<String> = ["src/app.rs", "src/main.rs"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        view.restore_review_state(cached, false);
+        view.restore_review_state(marks(&["src/app.rs", "src/main.rs"]), false);
 
         let names: Vec<&str> = view.visible_nodes.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, vec!["src", "README.md"]);
@@ -6062,11 +6303,7 @@ index 123456..789012 100644
     #[test]
     fn test_restore_review_state_drops_paths_no_longer_in_the_diff() {
         let mut view = review_fixture();
-        let cached: HashSet<String> = ["src/app.rs", "deleted/elsewhere.rs"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        view.restore_review_state(cached, false);
+        view.restore_review_state(marks(&["src/app.rs", "deleted/elsewhere.rs"]), false);
 
         assert_eq!(
             view.reviewed_files,

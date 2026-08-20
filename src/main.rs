@@ -6541,7 +6541,7 @@ async fn main() -> Result<()> {
                                 if let Some((_, marked)) = diff_view.toggle_reviewed() {
                                     app.store_reviewed_files_for_mr(
                                         diff_view.mr_iid,
-                                        &diff_view.reviewed_files,
+                                        &diff_view.reviewed_marks(),
                                     );
                                     crate::utils::cache::save_cache(
                                         &app.project_context,

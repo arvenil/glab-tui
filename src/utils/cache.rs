@@ -23,9 +23,24 @@ pub struct ProjectCache {
     pub label_colors: HashMap<String, String>,
     #[serde(default)]
     pub members: Vec<String>,
-    /// Files marked as reviewed in the diff view, keyed by MR/PR iid.
-    #[serde(default)]
-    pub reviewed_files: HashMap<u64, Vec<String>>,
+    /// Files marked as reviewed in the diff view, keyed by MR/PR iid, each
+    /// mapping the file path to the blob SHA it carried when it was marked.
+    #[serde(default, deserialize_with = "lenient_reviewed_files")]
+    pub reviewed_files: HashMap<u64, HashMap<String, String>>,
+}
+
+/// Reviewed marks were once a bare path list. A cache written by that shape
+/// must not fail the whole file — `load_cache` treats any deserialization error
+/// as "no cache", which would silently discard every other cached tab along
+/// with it. The old marks are dropped; everything else survives.
+fn lenient_reviewed_files<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<u64, HashMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 fn get_cache_file_path(project_context: &str) -> PathBuf {
@@ -374,5 +389,45 @@ mod tests {
 
         assert_eq!(deserialized.labels[0], "bug");
         assert_eq!(deserialized.members[1], "@user2");
+    }
+
+    #[test]
+    fn test_reviewed_files_round_trip_with_digests() {
+        let mut cache = ProjectCache::default();
+        cache.reviewed_files.insert(
+            363,
+            HashMap::from([("src/app.rs".to_string(), "7bb50a2".to_string())]),
+        );
+
+        let serialized = serde_json::to_string(&cache).unwrap();
+        let deserialized: ProjectCache = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            deserialized.reviewed_files[&363]["src/app.rs"],
+            "7bb50a2".to_string()
+        );
+    }
+
+    #[test]
+    fn test_a_cache_holding_the_old_path_list_still_loads() {
+        // Marks used to be a bare path list. `load_cache` treats a
+        // deserialization error as "no cache", so an unreadable marks field
+        // must not take the rest of the file down with it.
+        let json = r#"{
+            "issues": [], "mrs": [], "pipelines": [], "runners": [], "releases": [],
+            "todos": [], "milestones": [], "pipeline_jobs": {}, "branches": [],
+            "environments": [],
+            "labels": ["bug"],
+            "reviewed_files": {"363": ["src/app.rs", "src/main.rs"]}
+        }"#;
+
+        let cache: ProjectCache =
+            serde_json::from_str(json).expect("the old marks shape must not fail the whole cache");
+
+        assert_eq!(cache.labels, vec!["bug".to_string()]);
+        assert!(
+            cache.reviewed_files.is_empty(),
+            "unreadable marks are dropped, not resurrected without digests"
+        );
     }
 }

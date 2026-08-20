@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 - **Mark files as reviewed in the diff view** — `m` marks (or unmarks) the selected file as reviewed; on a directory it flips every file below it at once. Reviewed files carry a check indicator and fade to muted in the file tree; a directory fades and folds itself once all of its files are reviewed, cascading up through parents so a finished branch collapses to one line (unmarking reopens it, and a directory reopened by hand stays open). The tree header tracks progress (`12/200`). `M` filters reviewed files out of the tree entirely — directories with nothing left to review go with them — so a 200-file MR shrinks to just the pending work. Marks persist per MR/PR in the project cache and are restored when the diff is reopened; paths no longer present in the diff are dropped on restore (#362).
+- **Reviewed marks follow content, not paths** — each mark records the file's post-image blob SHA, so a file the author has changed since it was reviewed comes back unreviewed instead of staying ticked, muted and folded behind its parent. Files left untouched keep their marks, including across a rebase, because the check is git's own content identity rather than a version counter. The GitLab backend now fetches `glab mr diff --raw` — the git-format patch, which carries `index` lines where the rendered default does not — and falls back to the rendered form on older `glab` builds, where change detection is simply unavailable.
 
 ---
 

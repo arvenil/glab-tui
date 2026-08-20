@@ -1174,11 +1174,28 @@ impl Backend for GlabBackend {
     }
 
     async fn get_mr_diff(&self, project: &str, iid: u64) -> Result<String> {
-        self.run_glab(
-            &["mr", "diff", &iid.to_string(), "-R", project],
-            "Fetching MR Diff",
-        )
-        .await
+        // `--raw` is the git-format patch: `diff --git` headers, `a/`/`b/` path
+        // prefixes and `index <old>..<new>` blob SHAs — none of which the
+        // default rendering carries, and the last of which is what tells a
+        // reviewed file that its content moved under it. Older `glab` builds
+        // predate the flag, so a failure falls back to the rendered form: the
+        // diff still displays, it just cannot detect a changed file.
+        let raw = self
+            .run_glab(
+                &["mr", "diff", &iid.to_string(), "-R", project, "--raw"],
+                "Fetching MR Diff",
+            )
+            .await;
+        match raw {
+            Ok(diff) => Ok(diff),
+            Err(_) => {
+                self.run_glab(
+                    &["mr", "diff", &iid.to_string(), "-R", project],
+                    "Fetching MR Diff",
+                )
+                .await
+            }
+        }
     }
 
     async fn list_mr_notes(
