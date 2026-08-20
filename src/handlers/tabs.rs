@@ -523,66 +523,15 @@ pub async fn handle_active_tab_key(
                         ) =>
                         {
                             app.diff_loading = true;
-                            let tx = tx.clone();
-                            let mr_iid = mr_iid;
-                            let mr_iid_str = mr_iid.to_string();
-                            let client = app.gitlab_client.clone();
-                            let project_context = app.project_context.clone();
-                            tokio::spawn(async move {
-                                let is_github = client
-                                    .as_ref()
-                                    .is_some_and(|client| client.kind().is_github());
-
-                                let program = if is_github { "gh" } else { "glab" };
-                                let (entity, sub) = if is_github {
-                                    ("pr", "diff")
-                                } else {
-                                    ("mr", "diff")
-                                };
-                                let cmd_args =
-                                    vec![entity.to_string(), sub.to_string(), mr_iid_str.clone()];
-                                let status_msg =
-                                    format!("Fetching Diff: {} {}", program, cmd_args.join(" "));
-                                let _ = tx.send(Event::CommandStarted(status_msg));
-
-                                let mut cmd = tokio::process::Command::new(program);
-                                cmd.args(&cmd_args);
-
-                                let diff_res = cmd.output().await;
-
-                                let comments = if let Some(ref c) = client {
-                                    crate::domain::mr::list_mr_notes(c, &project_context, mr_iid)
-                                        .await
-                                        .unwrap_or_default()
-                                } else {
-                                    vec![]
-                                };
-
-                                match diff_res {
-                                    Ok(output) => {
-                                        if output.status.success() {
-                                            let raw_diff = String::from_utf8_lossy(&output.stdout)
-                                                .into_owned();
-                                            let _ = tx.send(Event::DiffFetched {
-                                                mr_iid,
-                                                raw_diff,
-                                                comments,
-                                            });
-                                        } else {
-                                            let err_msg = String::from_utf8_lossy(&output.stderr);
-                                            let _ = tx.send(Event::DiffFetchFailed(format!(
-                                                "Failed to fetch diff: {}",
-                                                err_msg
-                                            )));
-                                        }
-                                    }
-                                    Err(_) => {
-                                        let _ = tx.send(Event::DiffFetchFailed(
-                                            "Failed to execute CLI tool to fetch diff".to_string(),
-                                        ));
-                                    }
-                                }
-                            });
+                            // Opening a diff: the user is waiting on it, so a
+                            // failed fetch has to surface.
+                            crate::fetch::spawn_fetch_mr_diff(
+                                app.gitlab_client.clone(),
+                                app.project_context.clone(),
+                                mr_iid,
+                                tx.clone(),
+                                true,
+                            );
                         }
                         _ if keybinding_matches(
                             &app.config.keybindings.mrs.view_related_pipelines,

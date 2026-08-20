@@ -153,6 +153,10 @@ pub async fn get_mr(client: &GitlabClient, project_path: &str, iid: u64) -> Resu
     client.backend.get_mr(project_path, iid).await
 }
 
+pub async fn get_mr_diff(client: &GitlabClient, project_path: &str, iid: u64) -> Result<String> {
+    client.backend.get_mr_diff(project_path, iid).await
+}
+
 pub async fn list_mr_notes(
     client: &GitlabClient,
     project_path: &str,

@@ -3,6 +3,62 @@ use crate::domain;
 use crate::event::Event;
 use crate::git_helpers::get_current_branch;
 
+/// Fetches an MR/PR diff and its notes, then emits `DiffFetched`.
+///
+/// Both entry points — the `view_diff` keybinding and the post-action refresh of
+/// an already-open diff — come through here. They each used to spawn the CLI
+/// inline as a bare `glab mr diff <iid>` / `gh pr diff <iid>`, bypassing the
+/// backend and so losing two things: `-R <project>`, without which the diff
+/// comes from whatever repository the process's working directory happens to be
+/// in rather than the one selected in the TUI; and, on GitLab, `--raw`, whose
+/// `index` lines carry the blob SHAs the reviewed-file marks compare against.
+/// Without the latter a reviewed file the author had since rewritten kept its
+/// mark, because there was no content identity to notice the change.
+///
+/// `report_failure` separates the two callers: opening a diff must tell the user
+/// when the fetch failed, whereas refreshing one already on screen leaves the
+/// diff in place rather than replacing it with an error.
+pub fn spawn_fetch_mr_diff(
+    client: Option<domain::client::GitlabClient>,
+    project_context: String,
+    mr_iid: u64,
+    tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    report_failure: bool,
+) {
+    tokio::spawn(async move {
+        let Some(client) = client else {
+            if report_failure {
+                let _ = tx.send(Event::DiffFetchFailed(
+                    "No backend is configured to fetch the diff".to_string(),
+                ));
+            }
+            return;
+        };
+
+        let diff_res = domain::mr::get_mr_diff(&client, &project_context, mr_iid).await;
+        let comments = domain::mr::list_mr_notes(&client, &project_context, mr_iid)
+            .await
+            .unwrap_or_default();
+
+        match diff_res {
+            Ok(raw_diff) => {
+                let _ = tx.send(Event::DiffFetched {
+                    mr_iid,
+                    raw_diff,
+                    comments,
+                });
+            }
+            Err(err) => {
+                if report_failure {
+                    let _ = tx.send(Event::DiffFetchFailed(format!(
+                        "Failed to fetch diff: {err}"
+                    )));
+                }
+            }
+        }
+    });
+}
+
 /// Derive `workflow` for every MR in place.
 ///
 /// Called from three sites: the live fetch path below, and both cache-load
